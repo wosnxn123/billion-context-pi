@@ -39,6 +39,27 @@ export interface AdapterConfig {
    *  head-truncated with a notice telling the model how to see the full output
    *  (bash: read BashToolDetails.fullOutputPath). */
   toolOutputMaxBytes?: number;
+  /** Snap channel (cold-archive compressed-block summaries as bitmap frames,
+   *  official-snapcompact-aligned rebuild). "auto" (default) = PNG path on
+   *  vision models only; "on" = force; "off" = disabled. Env
+   *  ACP_SNAPCOMPACT=off|force overrides. */
+  snapcompact?: "auto" | "on" | "off";
+  /** Frame shape variant override (e.g. "silver16-bw"); default auto-detect. */
+  snapcompactVariant?: string;
+  /** Max frames kept per session (FIFO cap, official-style upper limit). Default 16. */
+  snapcompactMaxFrames?: number;
+  /** Newest N active blocks stay hot text; older are snap candidates. Default 6. */
+  snapHotBlocks?: number;
+  /** Auto-snap fires when unsnapped cold summaries sum >= this many tokens. Default 8000. */
+  snapThresholdTokens?: number;
+  /** Reserved (pi fires one context event shape; auto-snap runs on all of them). Default true. */
+  snapMidTurnEnabled?: boolean;
+  /** Idle snap maintenance (official-style reason "idle"). Default false. */
+  snapIdleEnabled?: boolean;
+  /** Idle snap requires >= this many seconds without a context event. Default 300. */
+  snapIdleTimeoutSeconds?: number;
+  /** Idle snap requires last observed usage >= this many tokens. Default 200000. */
+  snapIdleThresholdTokens?: number;
   coreOverrides?: Partial<Config>;
 }
 

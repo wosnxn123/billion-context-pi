@@ -15,6 +15,20 @@ import { makeStatusTool } from "./status-tool.js";
 import { makeDelegateTool, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot } from "./delegate-tool.js";
 import { makeCommands } from "./commands.js";
 import { coreOutToAgentMessages } from "./messages.js";
+import {
+  resolveSnapSettings,
+  snapEnabled,
+  hasVision,
+  autoSnapCandidates,
+  pruneManifest,
+  runSnap,
+  snapAttachment,
+  snappedView,
+  snapshotBlocks,
+  unsnappedCold,
+  type VisionModelLike,
+} from "./snap.js";
+import { loadManifest, type ShapeTarget, type SnapManifest } from "./snapcompact.js";
 import { ACP_SYSTEM_PROMPT, ACP_DELEGATE_PROMPT } from "./system-prompt.js";
 import { delegateStatusWidget } from "./fleet-widget.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
@@ -41,7 +55,7 @@ export function createAcpExtension(adapter: AdapterConfig = {}): ExtensionFactor
     pi.registerTool(makeDecompressTool(runtime));
     pi.registerTool(makeSearchTool(runtime));
     pi.registerTool(makeStatusTool(runtime));
-    for (const { name, options } of makeCommands(runtime)) {
+    for (const { name, options } of makeCommands(runtime, pi)) {
       pi.registerCommand(name, options);
     }
   };
@@ -58,6 +72,32 @@ function wireCompactionDisable(pi: ExtensionAPI): void {
 // (acp_delegate injection is best-effort: sendUserMessage is fire-and-forget
 // in pi, and interactive/rpc sessions are long-lived so their main loop
 // consumes the follow-up queue naturally — no shutdown drain needed.)
+
+let idleTimer: NodeJS.Timeout | null = null;
+
+// Idle maintenance (official-style reason "idle"): after snapIdleTimeoutSeconds
+// without a context event and with usage above snapIdleThresholdTokens, archive
+// cold blocks to frames in the background. Frames attach on the next rebuild.
+async function idleSnap(runtime: AcpRuntime): Promise<void> {
+  try {
+    const snap = resolveSnapSettings(runtime.adapter);
+    if (!snap.idleEnabled) return;
+    if (Date.now() - runtime.lastActivity < snap.idleTimeoutSeconds * 1000) return;
+    const sessionFile = runtime.lastSessionFile;
+    const usage = runtime.lastUsage;
+    if (!sessionFile || !usage || usage.tokens < snap.idleThresholdTokens) return;
+    const state = await runtime.store.load(sessionFile, "");
+    if (!snapEnabled(snap, undefined)) return;
+    if (snap.mode !== "on" && !runtime.lastModelVision) return;
+    const manifest = pruneManifest(sessionFile, state, snap);
+    const candidates = autoSnapCandidates(state, manifest, snap);
+    if (!candidates) return;
+    const result = await runSnap({ sessionFile, manifest, blocks: snapshotBlocks(candidates, null), settings: snap });
+    logInfo("snap", { event: "idle-snap", blocks: candidates.length, framesAdded: result.added });
+  } catch (e) {
+    logThrow("snap", e, { phase: "idle" });
+  }
+}
 
 function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime): void {
   pi.on("session_start", async (_event, ctx) => {
@@ -89,8 +129,19 @@ function wireSessionLifecycle(pi: ExtensionAPI, runtime: AcpRuntime): void {
     // running delegates below the editor. Only the interactive TUI has a UI;
     // rpc/json/print have hasUI=false and the call is a no-op.
     delegateStatusWidget.setContext(ctx, runningRunsSnapshot);
+    const snapSettings = resolveSnapSettings(runtime.adapter);
+    if (snapSettings.idleEnabled && !idleTimer) {
+      idleTimer = setInterval(() => {
+        void idleSnap(runtime);
+      }, 30_000);
+      if (typeof idleTimer.unref === "function") idleTimer.unref();
+    }
   });
   pi.on("session_shutdown", () => {
+    if (idleTimer) {
+      clearInterval(idleTimer);
+      idleTimer = null;
+    }
     delegateStatusWidget.dispose();
     closeLogStream();
   });
@@ -115,6 +166,10 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime): void {
       const realUsage = ctx.getContextUsage?.();
       const estimated = estimateTokens(coreMessages, coveredIds);
       const tokenCount = realUsage?.tokens && realUsage.tokens > 0 ? realUsage.tokens : estimated;
+      runtime.lastActivity = Date.now();
+      runtime.lastUsage = { tokens: tokenCount, limit: config.modelContextLimit };
+      runtime.lastSessionFile = ctx.sessionManager.getSessionFile() ?? null;
+      runtime.lastModelVision = hasVision(ctx.model as unknown as VisionModelLike | undefined);
 
       debug.event("context-in", {
         sid,
@@ -162,8 +217,40 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime): void {
       activeAfter: turn.state.blocks.filter((b) => b.active).length,
     });
 
+    // Snap channel: GC dead batches, auto-archive cold block summaries as
+    // frames (vision models only), then hide the anchor compress tool-calls
+    // of already-imaged blocks so their text summaries are not duplicated.
+    const snap = resolveSnapSettings(runtime.adapter);
+    const modelLike = ctx.model as unknown as VisionModelLike | undefined;
+    const sessionFile = ctx.sessionManager.getSessionFile() ?? undefined;
+    const snapOn = snapEnabled(snap, modelLike);
+    let manifest: SnapManifest = sessionFile
+      ? pruneManifest(sessionFile, turn.state, snap)
+      : { frames: [], archivedIds: [], batches: [] };
+    if (snapOn && sessionFile && hasVision(modelLike)) {
+      // Official overflow trigger: usage >= 80% snaps all pending cold blocks
+      // regardless of the quality threshold; otherwise the threshold gate decides.
+      const overflow = (realUsage?.percent ?? 0) >= 80;
+      const pending = overflow ? unsnappedCold(turn.state, manifest, snap) : null;
+      const candidates = overflow ? (pending && pending.length > 0 ? pending : null) : autoSnapCandidates(turn.state, manifest, snap);
+      if (candidates) {
+        const result = await runSnap({
+          sessionFile,
+          manifest,
+          blocks: snapshotBlocks(candidates, coreMessages),
+          settings: snap,
+          model: ctx.model as unknown as ShapeTarget,
+        });
+        manifest = result.manifest;
+        logInfo("snap", { sid, event: "auto-snap", blocks: candidates.length, framesAdded: result.added });
+      }
+    }
+    const snapped = snapOn
+      ? snappedView(turn.state, manifest)
+      : { blockIds: new Set<string>(), callIds: new Set<string>() };
+
     const originalById = collectOriginals(entries);
-    const rebuilt = coreOutToAgentMessages(turn.messages, originalById);
+    const rebuilt = coreOutToAgentMessages(turn.messages, originalById, snapped.callIds);
     const debugOn = debug.enabled;
 
     if (turn.nudge?.shouldInject) {
@@ -204,6 +291,20 @@ function wireContextTransform(pi: ExtensionAPI, runtime: AcpRuntime): void {
     // Always return the transformed array: every message needs its [mNNNNN] ref
     // tag applied, so there is no meaningful "no change" case to short-circuit.
     debug.event("context-out", { outMsgs: rebuilt.length, injected: turn.nudge?.shouldInject ?? false, emergency: turn.nudge?.breakdown?.emergencyOverride === 1 });
+    // One-shot directives (manual /acp-compact, /acp-snap text fallback) ride
+    // the next rebuild; frames attach at the head like the official imaged middle.
+    if (runtime.pendingDirective) {
+      rebuilt.push({
+        role: "user",
+        content: [{ type: "text", text: runtime.pendingDirective.text }],
+        timestamp: Date.now(),
+      } as AgentMessage);
+      runtime.pendingDirective = null;
+    }
+    if (snapOn && manifest.frames.length > 0) {
+      const attachment = snapAttachment(manifest);
+      if (attachment) rebuilt.unshift(attachment as unknown as AgentMessage);
+    }
     // Also check for updates here (not only on session_start): resuming a
     // long-running session never re-fires session_start, so an update could
     // go unnoticed for days. checkForUpdate throttles internally (3 min) and

@@ -15,6 +15,15 @@ export interface UserAcpConfig {
   delegate?: boolean;
   toolBashDefaultTimeout?: number;
   toolOutputMaxBytes?: number;
+  snapcompact?: "auto" | "on" | "off";
+  snapcompactVariant?: string;
+  snapcompactMaxFrames?: number;
+  snapHotBlocks?: number;
+  snapThresholdTokens?: number;
+  snapMidTurnEnabled?: boolean;
+  snapIdleEnabled?: boolean;
+  snapIdleTimeoutSeconds?: number;
+  snapIdleThresholdTokens?: number;
 }
 
 /** Read global + project acp.json, project overrides global. Returns {} on any
@@ -45,7 +54,7 @@ function join(... parts: string[]): string {
   return path.join(...parts);
 }
 
-const KNOWN = new Set(["debug", "autoUpdate", "modelContextLimit", "delegate", "toolBashDefaultTimeout", "toolOutputMaxBytes"]);
+const KNOWN = new Set(["debug", "autoUpdate", "modelContextLimit", "delegate", "toolBashDefaultTimeout", "toolOutputMaxBytes", "snapcompact", "snapcompactVariant", "snapcompactMaxFrames", "snapHotBlocks", "snapThresholdTokens", "snapMidTurnEnabled", "snapIdleEnabled", "snapIdleTimeoutSeconds", "snapIdleThresholdTokens"]);
 
 function pickKnown(parsed: Record<string, unknown>): UserAcpConfig {
   const out: UserAcpConfig = {};

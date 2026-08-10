@@ -134,12 +134,15 @@ function safeStringify(value: unknown): string {
 export function coreOutToAgentMessages(
   coreOut: CoreMessage[],
   originalById: Map<string, AgentMessage>,
+  snappedCallIds?: Set<string>,
 ): AgentMessage[] {
   const out: AgentMessage[] = [];
   const emittedSplit = new Set<string>();
 
   for (const core of coreOut) {
     if (core.id.startsWith("acp_summary_")) continue;
+    if (snappedCallIds && core.toolCallId && snappedCallIds.has(core.toolCallId)) continue;
+    if (snappedCallIds && snappedCallIds.has(core.id)) continue;
 
     const hashIdx = core.id.indexOf("#");
     if (hashIdx < 0) {

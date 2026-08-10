@@ -11,9 +11,9 @@ The model decides <em>when</em> and <em>what</em> to compress — not a hard lim
 ---
 
 <p align="center">
-<a href="https://www.npmjs.com/package/billion-context-pi"><img src="https://img.shields.io/npm/v/billion-context-pi.svg?style=flat-square" alt="npm"></a>
-<a href="https://github.com/ranxianglei/billion-context-pi/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context-pi.svg?style=flat-square" alt="license"></a>
-<a href="https://github.com/ranxianglei/billion-context-pi"><img src="https://img.shields.io/badge/GitHub-ranxianglei%2Fbillion--context--pi-181717?style=flat-square&logo=github" alt="GitHub"></a>
+<a href="https://www.npmjs.com/package/@wosnxn123/billion-context-pi"><img src="https://img.shields.io/npm/v/@wosnxn123/billion-context-pi.svg?style=flat-square" alt="npm"></a>
+<a href="https://github.com/wosnxn123/billion-context-pi/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context-pi.svg?style=flat-square" alt="license"></a>
+<a href="https://github.com/wosnxn123/billion-context-pi"><img src="https://img.shields.io/badge/GitHub-wosnxn123%2Fbillion--context--pi-181717?style=flat-square&logo=github" alt="GitHub"></a>
 </p>
 
 <p align="center">
@@ -40,7 +40,7 @@ This means:
 ## Install
 
 ```bash
-pi install npm:billion-context-pi
+pi install npm:@wosnxn123/billion-context-pi   # or: omp install @wosnxn123/billion-context-pi
 ```
 
 That's it. The extension auto-loads on next Pi startup. No configuration needed — it reads your model's context window automatically.
@@ -133,6 +133,21 @@ Blocks: 3 active (3.7K summary, 15.2K original compressed)
   b3 (T2)  3.3K→1.0K  age=1m  "Architecture review"
 ```
 
+## Snap channel (bitmap cold archive)
+
+A second, independent channel modeled on OMP's official **snapcompact**: instead of imaging freshly discarded history, it cold-archives the plugin's **already-compressed block summaries** as bitmap PNG frames, freeing text budget while keeping the content readable.
+
+- **Default compression is unchanged** — model-driven, text summaries (`compress` tool, nudges, tiers).
+- **`/acp-snap`** — manual cold archive. Vision model: renders all unsnapped cold blocks (active blocks outside the `snapHotBlocks` window) into content-addressed PNG frames and hides their anchor `compress` tool-calls so text and image never duplicate. Frames render the block's **original transcript in the official scoped format** (`¶user:` / `¶think:` / `¶ai:` / `¶call:` with tool output dimmed gray), so archives read like official snapcompact frames instead of flat summary text. Text model: falls back to an immediate tier-2 distillation of those blocks. Named `acp-snap` for consistency with the other `acp-*` commands.
+- **`/acp-compact`** — manual compression, executed immediately: the directive is dispatched as a follow-up turn the moment you run it (no waiting for your next message). Named `acp-compact` because hosts with a built-in `/compact` (pi, omp) intercept that name before extension commands; the built-in attempt is cancelled by the plugin (`session_before_compact`).
+- **Auto-snap** — after any turn, when unsnapped cold summaries sum to `snapThresholdTokens` or more, **or immediately at overflow (context usage ≥ 80%, official overflow trigger)**. Optional **idle** maintenance (`snapIdleEnabled`) mirrors the official `reason: "idle"` path.
+- **Rebuild alignment with official snapcompact**: frames are a pure function of bounded source text (re-serialized from the block's original messages each time, never blind PNG carry-forward); hot text window + imaged cold middle; FIFO `snapcompactMaxFrames` cap; batches whose blocks were consumed by tier-2 distillation are GC'd with their frames.
+- **Storage**: sidecar manifest `<session>.snap.json` + PNGs in `~/.pi/snap/` (override `ACP_SNAP_DIR`). `acp_status` reports the frame count.
+
+`/acp-snap` and `/acp-compact` answer with the official-style divider feedback (`── 📷 snapped ──` + `Compacted from N tokens` + `_N snapcompact frames attached_`); `/acp` additionally lists the archived frames line. Shape table is the full official 17-variant set (incl. `sent` color variants, selectable via `snapcompactVariant`); `snapcompactMaxFrames` is clamped to the official hard cap of 80.
+
+Requires a vision-capable model for the PNG path (`model.input` includes `"image"`); `snapcompact: "on"` forces it, `ACP_SNAPCOMPACT=off` kills it. Rendering is local and deterministic — no model call, safe at any context pressure.
+
 ## Configuration
 
 billion-context-pi works out of the box with no configuration. Three optional keys can be set in a JSON config file.
@@ -148,7 +163,9 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
   "modelContextLimit": 200000,
   "delegate": true,
   "toolBashDefaultTimeout": 60,
-  "toolOutputMaxBytes": 200000
+  "toolOutputMaxBytes": 200000,
+  "snapcompact": "auto",
+  "snapcompactMaxFrames": 16
 }
 ```
 
@@ -160,14 +177,25 @@ Create `~/.pi/acp.json` (global) and/or `<project>/.pi/acp.json` (project-local,
 | `delegate` | `true` | Enable the `acp_delegate` tools (delegate/wait/cancel) and their system-prompt section. Set `false` to skip registering them (e.g. you use a different sub-agent extension, or run headless where async injection adds no value). |
 | `toolBashDefaultTimeout` | `60` | Seconds injected into the `bash` tool when the model omits `timeout`. Pi has **no** default of its own, so without this a forgotten timeout can hang for thousands of seconds. On timeout the model is guided to re-run with a larger `timeout`. `0` restores Pi's unbounded behavior. |
 | `toolOutputMaxBytes` | `200000` | Hard byte cap on tool result text (~5000 lines at ~40 B/line; applied via the `tool_result` hook). Stops runaway output that Pi's own 50KB/2000-line cap can't catch (e.g. tools Pi doesn't cap). When it fires the model is told how to see the full output — for `bash` the full output is in its temp file (`BashToolDetails.fullOutputPath`); set lower (e.g. `8192`) for a tighter context budget, or `0` to disable. |
+| `snapcompact` | `"auto"` | Snap channel (cold-archive compressed-block summaries as bitmap frames, rebuild aligned with OMP's official snapcompact). `"auto"` = PNG path on vision-capable models only; `"on"` = force; `"off"` = disabled. Env `ACP_SNAPCOMPACT=off\|force` overrides. |
+| `snapcompactVariant` | *(auto)* | Frame shape variant override (e.g. `"silver16-bw"`); default auto-detects from the model. |
+| `snapcompactMaxFrames` | `16` | Max frames kept per session (FIFO cap). Clamped to the official hard cap of 80 — config can only lower, never raise. |
+| `snapHotBlocks` | `6` | Newest N active blocks stay hot text; older blocks are snap candidates. |
+| `snapThresholdTokens` | `8000` | Auto-snap fires when unsnapped cold summaries sum to at least this many tokens. |
+| `snapMidTurnEnabled` | `true` | Reserved (pi fires one context-event shape; auto-snap runs on all of them). |
+| `snapIdleEnabled` | `false` | Idle snap maintenance (official-style reason `"idle"`). |
+| `snapIdleTimeoutSeconds` | `300` | Idle snap requires at least this many seconds without a context event. |
+| `snapIdleThresholdTokens` | `200000` | Idle snap requires last observed usage of at least this many tokens. |
 
-> **Only these six keys are read from `acp.json`.** Other tuning knobs (`preserveRecentMessages`, `protectedTools`, nudge thresholds) are code-level and not user-overridable.
+> Keys not listed here (e.g. `preserveRecentMessages`, `protectedTools`, nudge thresholds) are code-level and not user-overridable.
 
 ### Environment variables
 
 | Variable | Effect |
 |----------|--------|
 | `ACP_AUTO_UPDATE` | Set to `0` / `false` / `no` / `off` (case-insensitive) to disable auto-update, overriding the config. |
+| `ACP_SNAPCOMPACT` | `off` disables / `force` enables the snap channel, overriding the config. |
+| `ACP_SNAP_DIR` | Override the frame store directory (default `~/.pi/snap`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit. Takes precedence over the config value. |
 | `ACP_DEBUG` | Set to `1` or `true` to enable debug-level logging (always-on events are written regardless). |
 | `ACP_LOG_FILE` | Override the log file path (default `~/.pi/acp.log`). |

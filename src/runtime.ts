@@ -54,6 +54,16 @@ export interface AcpRuntime {
   stateFor(ctx: ExtensionContext, liveMessages?: AgentMessage[]): Promise<{ state: CompressionState; coreMessages: ReturnType<typeof entriesToCoreMessages>; entries: SessionEntry[] }>;
   save(state: CompressionState, ctx: ExtensionContext): Promise<void>;
   acquireLock(sid: string): Promise<() => void>;
+  /** One-shot directive injected into the next context rebuild (manual
+   *  /acp-compact, /acp-snap text fallback). Consumed by the context transform. */
+  pendingDirective: { text: string } | null;
+  /** Timestamp of the last context event (idle-snap baseline). */
+  lastActivity: number;
+  /** Last observed usage snapshot + session file (idle-snap inputs). */
+  lastUsage: { tokens: number; limit: number } | null;
+  lastSessionFile: string | null;
+  /** Vision capability of the model seen on the last context event. */
+  lastModelVision: boolean;
 }
 
 // omp fires the context event before the current user message is persisted to
@@ -116,6 +126,11 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
   const locks = new Map<string, Promise<void>>();
   let adapterRef = adapter;
   const nudgeShownTurns = new Set<string>();
+  let pendingDirective: { text: string } | null = null;
+  let lastActivity = Date.now();
+  let lastUsage: { tokens: number; limit: number } | null = null;
+  let lastSessionFile: string | null = null;
+  let lastModelVision = false;
 
   async function acquireLock(sid: string): Promise<() => void> {
     const prev = locks.get(sid) ?? Promise.resolve();
@@ -165,5 +180,5 @@ export function createRuntime(adapter: AdapterConfig): AcpRuntime {
     await store.save(state, sm.getSessionFile() ?? undefined, sm.getSessionId());
   }
 
-  return { core, store, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, markNudgeShown: (k) => { nudgeShownTurns.add(k); }, nudgeShownFor: (k) => nudgeShownTurns.has(k), clearNudgeTracking: () => { nudgeShownTurns.clear(); }, liveContextLimit, configFor, stateFor, save, acquireLock };
+  return { core, store, get adapter() { return adapterRef; }, setAdapter: (a) => { adapterRef = a; }, markNudgeShown: (k) => { nudgeShownTurns.add(k); }, nudgeShownFor: (k) => nudgeShownTurns.has(k), clearNudgeTracking: () => { nudgeShownTurns.clear(); }, liveContextLimit, configFor, stateFor, save, acquireLock, get pendingDirective() { return pendingDirective; }, set pendingDirective(d) { pendingDirective = d; }, get lastActivity() { return lastActivity; }, set lastActivity(t) { lastActivity = t; }, get lastUsage() { return lastUsage; }, set lastUsage(u) { lastUsage = u; }, get lastSessionFile() { return lastSessionFile; }, set lastSessionFile(f) { lastSessionFile = f; }, get lastModelVision() { return lastModelVision; }, set lastModelVision(v) { lastModelVision = v; } };
 }

@@ -4,6 +4,7 @@ import type { AcpRuntime } from "./runtime.js";
 import { buildStatusReport, defaultCountTokens, formatRanges } from "acp-kernel";
 import { estimateTokens, collectCoveredMessageIds } from "./tokens.js";
 import { logThrow } from "./log.js";
+import { loadManifest } from "./snapcompact.js";
 
 const StatusParams = Type.Object({
   scope: Type.Optional(Type.Union([Type.Literal("compressed"), Type.Literal("uncompressed")], { description: '"compressed" = drill into blocks; "uncompressed" = show visible messages/ranges. Default: overview.' })),
@@ -91,6 +92,11 @@ async function handleStatus(args: StatusArgs, runtime: AcpRuntime, ctx: Extensio
     // and /acp all render compressible+protected ranges identically
     // (merged oldest-first, with mixed-range breakdowns).
     extra.push(formatRanges(ranges, protectedRanges));
+  }
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  const manifest = sessionFile ? loadManifest(sessionFile) : null;
+  if (manifest && (manifest.frames.length > 0 || manifest.archivedIds.length > 0)) {
+    extra.push(`Snap frames: ${manifest.frames.length} active (${manifest.archivedIds.length} blocks imaged${manifest.batches?.length ? `, ${manifest.batches.length} batches` : ""})`);
   }
   return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }

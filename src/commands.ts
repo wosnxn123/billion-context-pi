@@ -1,13 +1,43 @@
-import type { ExtensionCommandContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import type { AcpRuntime } from "./runtime.js";
 import { defaultCountTokens, parseBlockIdArg, collectBlockContent, formatRanges } from "acp-kernel";
 import { getSystemPromptText } from "./compat.js";
+import {
+  resolveSnapSettings,
+  hasVision,
+  runSnap,
+  pruneManifest,
+  unsnappedCold,
+  coldBlocks,
+  distillDirective,
+  compactDirective,
+  snapshotBlocks,
+  type VisionModelLike,
+} from "./snap.js";
+import { frameTokens, loadManifest, type ShapeTarget, type SnapManifest } from "./snapcompact.js";
 
 declare const CURRENT_VERSION: string;
 
 type CommandOptions = Omit<RegisteredCommand, "name" | "sourceInfo">;
 
-export function makeCommands(runtime: AcpRuntime): Array<{ name: string; options: CommandOptions }> {
+export function makeCommands(runtime: AcpRuntime, pi: ExtensionAPI): Array<{ name: string; options: CommandOptions }> {
+  // Hosts with a built-in /compact (pi, omp) intercept that name before
+  // extension commands see it, so manual plugin compression lives under
+  // /acp-compact; the built-in attempt is cancelled by our
+  // session_before_compact hook ("Error: Compaction cancelled").
+  const compactCommand: CommandOptions = {
+    description: "Manual compression: force the model to compress everything compressible now (plugin compression).",
+    handler: async (_args, ctx) => {
+      const text = compactDirective();
+      const send = pi.sendUserMessage;
+      if (typeof send === "function") {
+        // Kick a turn immediately — no waiting for the user's next message.
+        ctx.ui.notify(`${divider("🗜 compacted")}\nmanual compression started`);
+      } else {
+        ctx.ui.notify("🗜 queued — runs on the next turn");
+      }
+    },
+  };
   return [
     {
       name: "acp",
@@ -69,6 +99,69 @@ export function makeCommands(runtime: AcpRuntime): Array<{ name: string; options
         },
       },
     },
+    {
+      name: "acp-compact",
+      options: compactCommand,
+    },
+    {
+      name: "acp-snap",
+      options: {
+        description: "Cold-archive compressed-block summaries: vision model → PNG frames; text model → tier-2 distillation.",
+        handler: async (_args, ctx) => {
+          const snap = resolveSnapSettings(runtime.adapter);
+          if (snap.mode === "off") {
+            ctx.ui.notify('📷 snap disabled (acp.json "off" / ACP_SNAPCOMPACT=off)');
+            return;
+          }
+          const { state, coreMessages } = await runtime.stateFor(ctx);
+          const sessionFile = ctx.sessionManager.getSessionFile();
+          if (!sessionFile) {
+            ctx.ui.notify("📷 no session file");
+            return;
+          }
+          const manifest = pruneManifest(sessionFile, state, snap);
+          const candidates = unsnappedCold(state, manifest, snap);
+          const cold = coldBlocks(state, snap).length;
+          if (candidates.length === 0) {
+            ctx.ui.notify(
+              cold > 0
+                ? `📷 ${cold} cold blocks already imaged (${manifest.frames.length} frames attached)`
+                : "📷 nothing to snap — hot window covers all active blocks",
+            );
+            return;
+          }
+          const model = ctx.model as unknown as VisionModelLike | undefined;
+          if (!hasVision(model)) {
+            const text = distillDirective(candidates);
+            const send = pi.sendUserMessage;
+            if (typeof send === "function") {
+              send.call(pi, text, { deliverAs: "followUp" });
+              ctx.ui.notify(`📷 no vision — tier-2 distillation of ${candidates.length} cold blocks started`);
+            } else {
+              runtime.pendingDirective = { text };
+              ctx.ui.notify(`📷 no vision — tier-2 distillation of ${candidates.length} cold blocks queued (next turn)`);
+            }
+            return;
+          }
+          const snapshots = snapshotBlocks(candidates, coreMessages);
+          const result = await runSnap({
+            sessionFile,
+            manifest,
+            blocks: snapshots,
+            settings: snap,
+            model: ctx.model as unknown as ShapeTarget,
+          });
+          ctx.ui.notify(
+            snapFeedback({
+              blocks: candidates.length,
+              added: result.added,
+              manifest: result.manifest,
+              tokensBefore: candidates.reduce((s, b) => s + (b.compressedTokens || 0), 0),
+            }),
+          );
+        },
+      },
+    },
   ];
 }
 
@@ -82,6 +175,25 @@ function bar(value: number, total: number, width: number = 20): string {
   if (total === 0) return "";
   const filled = Math.max(0, Math.min(width, Math.round((value / total) * width)));
   return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
+/** Official-style divider feedback line (📷 snapped / 🗜 compacted). */
+function divider(label: string): string {
+  const width = 45;
+  const inner = ` ${label} `;
+  const pad = Math.max(0, width - inner.length);
+  const left = Math.floor(pad / 2);
+  return "─".repeat(left) + inner + "─".repeat(pad - left);
+}
+
+/** Official compaction feedback: divider + Compacted-from line + frames note. */
+function snapFeedback(r: { blocks: number; added: number; manifest: SnapManifest; tokensBefore: number }): string {
+  return [
+    divider("📷 snapped"),
+    `Compacted from ${r.tokensBefore.toLocaleString()} tokens`,
+    `${r.blocks} cold blocks → ${r.added} new frame${r.added === 1 ? "" : "s"}`,
+    `_${r.manifest.frames.length} snapcompact frame${r.manifest.frames.length === 1 ? "" : "s"} attached_`,
+  ].join("\n");
 }
 
 async function statusReport(runtime: AcpRuntime, ctx: ExtensionCommandContext): Promise<string> {
@@ -183,6 +295,12 @@ async function statusReport(runtime: AcpRuntime, ctx: ExtensionCommandContext): 
   } else {
     lines.push("");
     lines.push("Blocks: none (nothing compressed yet)");
+  }
+
+  const snapManifest = loadManifest(ctx.sessionManager.getSessionFile() ?? "");
+  if (snapManifest.frames.length > 0) {
+    lines.push("");
+    lines.push(`Frames: ${snapManifest.frames.length} archived (${fmtTokens(frameTokens(snapManifest))} billed tokens)`);
   }
 
   lines.push("");
